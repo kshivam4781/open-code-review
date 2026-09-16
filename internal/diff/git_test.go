@@ -152,6 +152,91 @@ func TestGetDiffSetWalksChangesetOrder(t *testing.T) {
 	}
 }
 
+// TestGetDiffSetWalksChangesetOrderWithGitignoreDrop pins the invariant
+// ForEachInOrder's index arithmetic relies on: a file dropped by .gitignore
+// contributes to neither the Included nor the Excluded counter, so excludedAt
+// (recorded as len(Included)+len(Excluded) at the time each provider-dir
+// exclusion is seen) still lines up with the mixed included+excluded stream
+// even when a gitignore-dropped file sat earlier in the raw changeset.
+//
+// "ignored.go" sits between the included and provider-excluded files in the
+// changeset order (a.go < ignored.go < target/mid.go alphabetically), so a
+// regression that counted it anyway would skew ForEachInOrder's walk.
+func TestGetDiffSetWalksChangesetOrderWithGitignoreDrop(t *testing.T) {
+	repo := t.TempDir()
+	runGitTest(t, repo, "init", "-q")
+	runGitTest(t, repo, "config", "user.email", "test@example.com")
+	runGitTest(t, repo, "config", "user.name", "Test User")
+	runGitTest(t, repo, "config", "commit.gpgsign", "false")
+
+	paths := []string{"a.go", "ignored.go", "target/mid.go"}
+	write := func(content string) {
+		t.Helper()
+		for _, p := range paths {
+			full := filepath.Join(repo, filepath.FromSlash(p))
+			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+				t.Fatalf("mkdir %s: %v", p, err)
+			}
+			if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+				t.Fatalf("write %s: %v", p, err)
+			}
+		}
+	}
+	write("package p\n")
+	// .gitignore is committed alongside the source files, and "ignored.go" is
+	// force-added despite matching it: a .gitignore rule never untracks a file
+	// already committed, so this is exactly the scenario that makes it still
+	// show up in `git diff` for partitionDiffs to drop. Leaving .gitignore
+	// untracked would instead surface it as its own untracked-file diff
+	// (appended after every tracked change, never interleaved), which is not
+	// the case this test is pinning.
+	gitignore := filepath.Join(repo, ".gitignore")
+	if err := os.WriteFile(gitignore, []byte("ignored.go\n"), 0o644); err != nil {
+		t.Fatalf("write .gitignore: %v", err)
+	}
+	runGitTest(t, repo, "add", "-f", ".")
+	runGitTest(t, repo, "commit", "-q", "-m", "add files")
+
+	write("package p\n\nconst V = 2\n")
+
+	set, err := NewWorkspaceProvider(repo, gitcmd.New(0)).GetDiffSet(context.Background())
+	if err != nil {
+		t.Fatalf("GetDiffSet: %v", err)
+	}
+
+	wantIncluded := []string{"a.go"}
+	var gotIncluded []string
+	for _, d := range set.Included {
+		gotIncluded = append(gotIncluded, d.NewPath)
+	}
+	if !slices.Equal(gotIncluded, wantIncluded) {
+		t.Errorf("Included = %v, want %v", gotIncluded, wantIncluded)
+	}
+
+	wantExcluded := []string{"target/mid.go"}
+	var gotExcluded []string
+	for _, d := range set.Excluded {
+		gotExcluded = append(gotExcluded, d.NewPath)
+	}
+	if !slices.Equal(gotExcluded, wantExcluded) {
+		t.Errorf("Excluded = %v, want %v", gotExcluded, wantExcluded)
+	}
+
+	var got []string
+	var flags []bool
+	set.ForEachInOrder(func(d model.Diff, providerExcluded bool) {
+		got = append(got, d.NewPath)
+		flags = append(flags, providerExcluded)
+	})
+	wantOrder := []string{"a.go", "target/mid.go"}
+	if !slices.Equal(got, wantOrder) {
+		t.Errorf("ForEachInOrder paths = %v, want %v (ignored.go must never be visited)", got, wantOrder)
+	}
+	if len(flags) != 2 || flags[0] || !flags[1] {
+		t.Errorf("providerExcluded flags = %v, want [false true]", flags)
+	}
+}
+
 // initRepoWithNonASCIIChange creates a repository whose changed file path
 // contains both non-ASCII characters and Next.js-style route groups. It forces
 // Git's default path quoting so tests do not depend on the user's global config.
