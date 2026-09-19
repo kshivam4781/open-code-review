@@ -30,8 +30,14 @@ func TestHandleRepos_Success(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "test-repo") {
+	body := rr.Body.String()
+	if !strings.Contains(body, "test-repo") {
 		t.Errorf("response does not contain repo name")
+	}
+	// repos.js calls window.ocrArrowScroll on its table-scroll region; a11y.js
+	// must still be requested ahead of it or that call throws.
+	if !strings.Contains(body, `src="/static/a11y.js"`) {
+		t.Errorf("response does not reference /static/a11y.js")
 	}
 }
 
@@ -124,6 +130,11 @@ func TestHandleSessions_Success(t *testing.T) {
 	body := rr.Body.String()
 	if !strings.Contains(body, "project") {
 		t.Errorf("response does not contain repo display name derived from CWD")
+	}
+	// sessions.js calls window.ocrArrowScroll on its table-scroll region; a11y.js
+	// must still be requested ahead of it or that call throws.
+	if !strings.Contains(body, `src="/static/a11y.js"`) {
+		t.Errorf("response does not reference /static/a11y.js")
 	}
 }
 

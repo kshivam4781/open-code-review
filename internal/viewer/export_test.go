@@ -54,6 +54,10 @@ func TestExportSession_SelfContained(t *testing.T) {
 		// the shared nav-brand partial, logo included, de-linked
 		`<span class="nav-brand"><span class="brand-icon" aria-hidden="true"><svg`,
 		"sess1", // the session itself rendered
+		// a11y.js must still be prepended ahead of session.js: session.js's
+		// first line calls this, and a dropped concatenation throws there,
+		// silently taking every bit of interactivity with it.
+		"window.ocrArrowScroll",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("export missing %q", want)

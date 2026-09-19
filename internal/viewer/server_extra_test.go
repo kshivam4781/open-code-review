@@ -423,6 +423,105 @@ func TestTextTokens_MeetWCAGAAOnPageBackground(t *testing.T) {
 	}
 }
 
+// TestTextTokens_MeetWCAGAAOnPanelSurfaces extends the coverage above to the
+// three panel tokens (--surface, --surface-inset, --surface-alt): most of the
+// app's body text sits on a panel, not the bare page background, so those are
+// the pairings that matter in practice.
+//
+// This needs its own blend, not the page-background test's: that test's
+// ratio() always flattens the text color as if it sat on pure white (light)
+// or pure black (dark) — channel := 1-alpha / alpha, with no dependence on
+// the actual page argument beyond the denominator. That is exactly right for
+// --bg, which *is* pure white/black in both themes, but silently wrong for a
+// panel: it would score every panel as if it were pure white or black too,
+// no matter how visibly gray --surface-inset/--surface-alt actually are.
+// Blending the alpha text over the panel's own color instead — not the
+// panel treated as its own flat color while the text is still flattened over
+// black/white, the mistake #1329's review made — moves the tightest pairing
+// (light --text-muted on --surface-inset) by several tenths, from a
+// comfortable margin down to 4.61:1, a 0.11 margin above the 4.5 floor.
+func TestTextTokens_MeetWCAGAAOnPanelSurfaces(t *testing.T) {
+	css, err := assets.ReadFile("static/style.css")
+	if err != nil {
+		t.Fatalf("read static/style.css: %v", err)
+	}
+	text := string(css)
+
+	darkStart := strings.Index(text, "@media (prefers-color-scheme: dark)")
+	if darkStart == -1 {
+		t.Fatal("style.css is missing the dark @media block")
+	}
+	panelGray := func(section, theme, token string) float64 {
+		t.Helper()
+		pattern := regexp.MustCompile(regexp.QuoteMeta(token) + `: (#[0-9a-fA-F]{6});`)
+		ms := pattern.FindAllStringSubmatch(section, -1)
+		if len(ms) != 1 {
+			t.Fatalf("%s section has %d %s tokens, want exactly 1", theme, len(ms), token)
+		}
+		v, err := strconv.ParseInt(strings.TrimPrefix(ms[0][1], "#"), 16, 32)
+		if err != nil {
+			t.Fatalf("parse %s %q: %v", token, ms[0][1], err)
+		}
+		// The token is a flat hex like #f5f5f5; one channel is the gray.
+		return float64(v&0xff) / 255
+	}
+
+	luminance := func(channel float64) float64 {
+		if channel <= 0.04045 {
+			return channel / 12.92
+		}
+		return math.Pow((channel+0.055)/1.055, 2.4)
+	}
+	// ratio blends the token's alpha over the *panel's* own color (rather
+	// than assuming pure black/white) and returns the WCAG contrast ratio of
+	// the resulting gray against that same panel.
+	ratio := func(alpha float64, whiteText bool, panel float64) float64 {
+		base := 0.0
+		if whiteText {
+			base = 1.0
+		}
+		channel := base*alpha + panel*(1-alpha)
+		fg, bg := luminance(channel), luminance(panel)
+		if fg < bg {
+			fg, bg = bg, fg
+		}
+		return (fg + 0.05) / (bg + 0.05)
+	}
+	onlyAlpha := func(pattern string) float64 {
+		t.Helper()
+		ms := regexp.MustCompile(pattern).FindAllStringSubmatch(text, -1)
+		if len(ms) != 1 {
+			t.Fatalf("style.css has %d matches for %q, want exactly 1 (a second theme reusing this channel pattern would make positional matching silently pick the wrong rule)", len(ms), pattern)
+		}
+		v, err := strconv.ParseFloat(ms[0][1], 64)
+		if err != nil {
+			t.Fatalf("parse alpha %q: %v", ms[0][1], err)
+		}
+		return v
+	}
+
+	tokens := []struct {
+		name       string
+		blackAlpha float64 // light mode: rgba(0, 0, 0, alpha)
+		whiteAlpha float64 // dark mode: rgba(255, 255, 255, alpha)
+	}{
+		{"--text-muted", onlyAlpha(`--text-muted: rgba\(0, 0, 0, ([\d.]+)\);`), onlyAlpha(`--text-muted: rgba\(255, 255, 255, ([\d.]+)\);`)},
+		{"--text-secondary", onlyAlpha(`--text-secondary: rgba\(0, 0, 0, ([\d.]+)\);`), onlyAlpha(`--text-secondary: rgba\(255, 255, 255, ([\d.]+)\);`)},
+	}
+	for _, panel := range []string{"--surface", "--surface-inset", "--surface-alt"} {
+		lightPanel := panelGray(text[:darkStart], "light", panel)
+		darkPanel := panelGray(text[darkStart:], "dark", panel)
+		for _, tc := range tokens {
+			if got := ratio(tc.blackAlpha, false, lightPanel); got < 4.5 {
+				t.Errorf("light %s on %s contrasts at %.2f:1, want >= 4.5 (WCAG AA)", tc.name, panel, got)
+			}
+			if got := ratio(tc.whiteAlpha, true, darkPanel); got < 4.5 {
+				t.Errorf("dark %s on %s contrasts at %.2f:1, want >= 4.5 (WCAG AA)", tc.name, panel, got)
+			}
+		}
+	}
+}
+
 // TestFocusCSS_CoversCollapsiblesAndTableLinks holds the focus-visible rules for the
 // collapsible headers, in-table links and scrollable table regions: these
 // elements have no other visible focus indicator, so losing the rule would
@@ -446,6 +545,37 @@ func TestFocusCSS_CoversCollapsiblesAndTableLinks(t *testing.T) {
 		if !strings.Contains(string(css), selector) {
 			t.Errorf("style.css is missing the %q focus-visible rule: "+
 				"these elements have no other visible focus indicator for keyboard users", selector)
+		}
+	}
+}
+
+// TestFocusCSS_TableLinksUseInsetOffset asserts the *effective* outline-offset
+// on the three selectors below, not just that a focus-visible rule exists for
+// them: .table a:focus-visible sets the shared -2px inset offset (so the ring
+// is not clipped by .table-scroll, whose overflow-y computes to auto), but
+// each of these three is written as its own, more specific rule and can
+// silently keep the default +2px even while a selector-presence check above
+// stays green.
+func TestFocusCSS_TableLinksUseInsetOffset(t *testing.T) {
+	css, err := assets.ReadFile("static/style.css")
+	if err != nil {
+		t.Fatalf("read static/style.css: %v", err)
+	}
+	text := string(css)
+	for _, selector := range []string{
+		".sessions-page .session-id:focus-visible",
+		".repos-page .col-repository a:focus-visible",
+		".repos-page .repo-check:focus-visible",
+	} {
+		block := regexp.MustCompile(regexp.QuoteMeta(selector) + `\s*\{([^}]*)\}`).FindStringSubmatch(text)
+		if block == nil {
+			t.Errorf("style.css is missing the %q rule block", selector)
+			continue
+		}
+		if !regexp.MustCompile(`outline-offset:\s*-2px;`).MatchString(block[1]) {
+			t.Errorf("%q does not set outline-offset: -2px; (found body: %q) — "+
+				"its ring would draw outside .table-scroll's clipping box, invisible on the first/last row",
+				selector, strings.TrimSpace(block[1]))
 		}
 	}
 }
@@ -973,6 +1103,9 @@ func TestHandleSession_ServedPageKeepsStaticRefs(t *testing.T) {
 	body := rr.Body.String()
 	for _, want := range []string{
 		`href="/static/style.css"`,
+		// session.js's first line calls window.ocrArrowScroll, so a11y.js must
+		// still be requested ahead of it; nothing else defines that global.
+		`src="/static/a11y.js"`,
 		`src="/static/session.js"`,
 		`<a href="/" class="nav-brand"`,
 		`<a href="/r/repo">`,
